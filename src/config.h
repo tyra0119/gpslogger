@@ -18,11 +18,12 @@
 // SD カード設定 (M5Stack Tab5 SDIO 4ビットモード)
 // =============================================================
 #define SD_CLK_PIN  43
-#define SD_CMD_PIN  44
-#define SD_D0_PIN   39
+#define SD_CMD_PIN  44   // SPI MOSI
+#define SD_D0_PIN   39   // SPI MISO
 #define SD_D1_PIN   40
 #define SD_D2_PIN   41
 #define SD_D3_PIN   42
+#define SD_CS_PIN   SD_D3_PIN  // SPI CS (D3 を CS として使用)
 
 // =============================================================
 // 住所データベース設定

@@ -23,8 +23,11 @@
 
 #include <M5Unified.h>
 #include <TinyGPSPlus.h>
-#include <SD_MMC.h>
+#include "driver/sdmmc_host.h"
+#include "esp_vfs_fat.h"
+#include "sdmmc_cmd.h"
 #include <math.h>
+#include <sys/stat.h>
 #include "config.h"
 
 // =============================================================
@@ -65,12 +68,17 @@ HardwareSerial gpsSerial(2);
 GpsSnapshot current;
 AddressInfo address;
 
+static sdmmc_card_t* s_card = nullptr;
+
 bool     sdAvailable       = false;
 bool     displayOn         = false;
 uint32_t displayOnTime     = 0;
 uint32_t lastDisplayUpdate = 0;
 uint32_t lastLogTime       = 0;
 bool     waitingForFix     = true;
+int      logCount          = 0;
+bool     lastWriteOk       = true;
+char     sdErrMsg[32]      = "";
 
 // =============================================================
 // 関数プロトタイプ
@@ -172,23 +180,68 @@ void loop() {
 // SD カード初期化
 // =============================================================
 void initSD() {
-    SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
-    if (SD_MMC.begin("/sdcard", true, false, 400000)) {
-        sdAvailable = true;
-        if (!SD_MMC.exists(LOG_DIRECTORY)) {
-            if (!SD_MMC.mkdir(LOG_DIRECTORY)) {
-                Serial.printf("[SD] ERROR: mkdir %s failed\n", LOG_DIRECTORY);
-            }
-        }
-        if (!SD_MMC.exists("/gpsdb")) {
-            Serial.println("[SD] WARNING: /gpsdb が存在しません。"
-                           "tools/generate_addr_db.py を実行して addr.csv を配置してください。");
-        }
-        Serial.printf("[SD] OK. 容量: %llu MB\n", SD_MMC.totalBytes() / (1024 * 1024));
-    } else {
+    // GPIO 45 = Tab5 SD カード電源制御
+    pinMode(45, OUTPUT);
+    digitalWrite(45, HIGH);
+    delay(300);
+
+    esp_vfs_fat_sdmmc_mount_config_t mount_config = {};
+    mount_config.format_if_mount_failed = false;
+    mount_config.max_files              = 8;
+    mount_config.allocation_unit_size   = 16 * 1024;
+
+    // IOMUX モード: 全ピンを SDMMC_SLOT_NO_PIN のままにすることで
+    // GPIO マトリックスを経由せずハードウェア本来の接続を使う。
+    // SD_MMC.setPins() は GPIO 番号を明示するため常に GPIO マトリックス経由になり、
+    // ESP32-P4 HP_SDMMC では書き込み時に CRC エラー(0x109)が発生していた。
+    sdmmc_host_t host    = SDMMC_HOST_DEFAULT();
+    host.max_freq_khz    = 400;  // 400kHz (安定確認後に上げる)
+
+    sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
+    slot_config.width = 1;  // 1ビットモード
+
+    esp_err_t ret = esp_vfs_fat_sdmmc_mount("/sdcard", &host, &slot_config, &mount_config, &s_card);
+    if (ret != ESP_OK) {
         sdAvailable = false;
-        Serial.println("[SD] Failed! SD カードを確認してください。");
+        snprintf(sdErrMsg, sizeof(sdErrMsg), "mnt失敗(%x)", (unsigned)ret);
+        Serial.printf("[SD] esp_vfs_fat_sdmmc_mount: 0x%x\n", ret);
+        return;
     }
+    Serial.println("[SD] Mounted (IOMUX 1-bit 400kHz).");
+
+    // ルートへの書き込みテスト
+    FILE* tf = fopen("/sdcard/writetest.tmp", "w");
+    if (!tf) {
+        sdAvailable = false;
+        strncpy(sdErrMsg, "root書込不可", sizeof(sdErrMsg) - 1);
+        Serial.println("[SD] fopen /sdcard/writetest.tmp failed");
+        return;
+    }
+    fputs("x", tf);
+    fflush(tf);
+    fclose(tf);
+
+    struct stat st;
+    bool writeOk = (stat("/sdcard/writetest.tmp", &st) == 0 && st.st_size > 0);
+    remove("/sdcard/writetest.tmp");
+    if (!writeOk) {
+        sdAvailable = false;
+        strncpy(sdErrMsg, "root書込失敗", sizeof(sdErrMsg) - 1);
+        Serial.println("[SD] Write test: size=0 after write");
+        return;
+    }
+    Serial.println("[SD] Write test OK.");
+
+    mkdir("/sdcard" LOG_DIRECTORY, 0777);
+    if (stat("/sdcard" LOG_DIRECTORY, &st) != 0) {
+        sdAvailable = false;
+        strncpy(sdErrMsg, "mkdir失敗", sizeof(sdErrMsg) - 1);
+        Serial.printf("[SD] mkdir %s failed\n", LOG_DIRECTORY);
+        return;
+    }
+
+    sdAvailable = true;
+    Serial.println("[SD] Ready.");
 }
 
 // =============================================================
@@ -237,34 +290,55 @@ bool locationMoved(double newLat, double newLon) {
 // SD カードへ GPS データを書き込む
 // =============================================================
 void logToSD() {
-    if (!sdAvailable || !current.valid) return;
+    if (!sdAvailable) {
+        Serial.println("[LOG] Skip: SD not available");
+        return;
+    }
+    if (!current.valid) {
+        Serial.println("[LOG] Skip: no GPS fix");
+        return;
+    }
 
-    String path  = buildLogPath();
-    bool   isNew = !SD_MMC.exists(path);
-    File   f     = SD_MMC.open(path, FILE_APPEND);
+    String path = buildLogPath();  // VFS パス (/sdcard/gpslog/...)
 
-    if (!f) {
+    struct stat st;
+    bool isNew = (stat(path.c_str(), &st) != 0);
+
+    FILE* fp = fopen(path.c_str(), "a");
+    if (!fp) {
         Serial.printf("[LOG] Cannot open: %s\n", path.c_str());
+        strncpy(sdErrMsg, "open失敗", sizeof(sdErrMsg) - 1);
+        lastWriteOk = false;
         return;
     }
 
     if (isNew) {
-        f.println("timestamp,latitude,longitude,altitude_m,speed_kmh,satellites,hdop");
+        fputs("timestamp,latitude,longitude,altitude_m,speed_kmh,satellites,hdop\n", fp);
     }
 
     char line[128];
     snprintf(line, sizeof(line),
-             "%04d-%02d-%02dT%02d:%02d:%02dZ,%.6f,%.6f,%.1f,%.1f,%d,%.2f",
+             "%04d-%02d-%02dT%02d:%02d:%02dZ,%.6f,%.6f,%.1f,%.1f,%d,%.2f\n",
              current.year, current.month, current.day,
              current.hour, current.minute, current.second,
              current.lat, current.lon,
              current.altitude, current.speed,
              current.satellites, current.hdop);
 
-    f.println(line);
-    f.close();
+    fputs(line, fp);
+    fflush(fp);
+    fclose(fp);
 
-    Serial.printf("[LOG] %s\n", line);
+    if (stat(path.c_str(), &st) == 0 && st.st_size > 0) {
+        logCount++;
+        lastWriteOk = true;
+        sdErrMsg[0] = '\0';
+        Serial.printf("[LOG] #%d %s", logCount, line);
+    } else {
+        lastWriteOk = false;
+        strncpy(sdErrMsg, "書込後size=0", sizeof(sdErrMsg) - 1);
+        Serial.printf("[LOG] WRITE FAILED: %s", line);
+    }
 }
 
 // =============================================================
@@ -272,12 +346,12 @@ void logToSD() {
 // =============================================================
 String buildLogPath() {
     if (current.year > 0) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "%s/gps_%04d%02d%02d.csv",
+        char buf[80];
+        snprintf(buf, sizeof(buf), "/sdcard%s/gps_%04d%02d%02d.csv",
                  LOG_DIRECTORY, current.year, current.month, current.day);
         return String(buf);
     }
-    return String(LOG_DIRECTORY) + "/gps_nodate.csv";
+    return "/sdcard" + String(LOG_DIRECTORY) + "/gps_nodate.csv";
 }
 
 // =============================================================
@@ -397,16 +471,31 @@ void drawDisplay() {
         }
     }
 
-    // --- フッター: 消灯カウントダウン ---
+    // --- フッター: 記録件数 + 消灯カウントダウン ---
     uint32_t elapsed   = millis() - displayOnTime;
     uint32_t remaining = (DISPLAY_TIMEOUT_MS > elapsed)
                          ? (DISPLAY_TIMEOUT_MS - elapsed) / 1000 : 0;
 
-    M5.Display.fillRect(0, h - 42, w, 42, 0x2104);
-    M5.Display.setTextColor(TFT_LIGHTGREY);
+    M5.Display.fillRect(0, h - 62, w, 62, 0x2104);
     M5.Display.setTextSize(2);
-    M5.Display.setCursor(12, h - 28);
-    M5.Display.printf("消灯まで %2ds   [ボタン/タップで延長]", remaining);
+
+    if (!lastWriteOk || (!sdAvailable && sdErrMsg[0] != '\0')) {
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(12, h - 58);
+        M5.Display.printf("SDエラー:%s", sdErrMsg);
+    } else if (!sdAvailable) {
+        M5.Display.setTextColor(TFT_RED);
+        M5.Display.setCursor(12, h - 58);
+        M5.Display.print("SD未検出!");
+    } else {
+        M5.Display.setTextColor(TFT_GREEN);
+        M5.Display.setCursor(12, h - 58);
+        M5.Display.printf("記録済: %d件", logCount);
+    }
+
+    M5.Display.setTextColor(TFT_LIGHTGREY);
+    M5.Display.setCursor(12, h - 30);
+    M5.Display.printf("消灯まで %2ds   [タップで延長]", remaining);
 }
 
 // =============================================================
@@ -445,41 +534,31 @@ void onButtonPressed() {
 bool lookupAddress(double targetLat, double targetLon) {
     if (!sdAvailable) return false;
 
-    File f = SD_MMC.open(ADDR_DB_PATH);
-    if (!f) {
-        Serial.printf("[Addr] Cannot open %s\n", ADDR_DB_PATH);
+    FILE* fp = fopen("/sdcard" ADDR_DB_PATH, "r");
+    if (!fp) {
+        Serial.printf("[Addr] Cannot open /sdcard%s\n", ADDR_DB_PATH);
         return false;
     }
 
-    f.readStringUntil('\n');  // ヘッダー行をスキップ
+    char line[128];
+    fgets(line, sizeof(line), fp);  // ヘッダー行をスキップ
 
     float bestDistSq   = ADDR_MAX_DIST_SQ;
     char  bestPref[32] = "";
     char  bestCity[48] = "";
     float cosLat       = cosf((float)targetLat * (float)M_PI / 180.0f);
 
-    char line[128];
-    int  lineLen;
-
-    while (f.available()) {
-        lineLen = 0;
-        while (f.available() && lineLen < (int)sizeof(line) - 1) {
-            char c = (char)f.read();
-            if (c == '\n') break;
-            if (c != '\r') line[lineLen++] = c;
-        }
-        line[lineLen] = '\0';
-        if (lineLen == 0) continue;
+    while (fgets(line, sizeof(line), fp) != nullptr) {
+        int len = strlen(line);
+        while (len > 0 && (line[len-1] == '\n' || line[len-1] == '\r')) line[--len] = '\0';
+        if (len == 0) continue;
 
         char* fields[4];
         int   fi  = 0;
         char* ptr = line;
         fields[fi++] = ptr;
         while (*ptr != '\0' && fi < 4) {
-            if (*ptr == ',') {
-                *ptr = '\0';
-                fields[fi++] = ptr + 1;
-            }
+            if (*ptr == ',') { *ptr = '\0'; fields[fi++] = ptr + 1; }
             ptr++;
         }
         if (fi < 4) continue;
@@ -502,7 +581,7 @@ bool lookupAddress(double targetLat, double targetLon) {
         }
     }
 
-    f.close();
+    fclose(fp);
 
     if (bestDistSq < ADDR_MAX_DIST_SQ) {
         strncpy(address.prefecture, bestPref, sizeof(address.prefecture) - 1);

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pio boards)",
+      "PowerShell(findstr /i m5)",
+      "PowerShell(if \\(Test-Path \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\"\\) { Write-Host \"Found\" } else { Write-Host \"Not found\" })",
+      "PowerShell(& \"$env:USERPROFILE\\\\.platformio\\\\penv\\\\Scripts\\\\pio.exe\" boards | Select-String -Pattern \"m5\" -CaseSensitive:$false)",
+      "Read(//c/Users/takas/.platformio/**)",
+      "Read(//c/Users/takas/.platformio/platforms/**)",
+      "Bash(python3 -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\('version:', d.get\\('version'\\)\\); print\\('frameworks:', list\\(d.get\\('frameworks',{}\\).keys\\(\\)\\)\\)\")",
+      "Bash(~/.platformio/penv/bin/pip show *)",
+      "Bash(~/.platformio/penv/bin/pip index *)",
+      "Bash(xargs grep *)",
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:registry.platformio.org)",
+      "WebFetch(domain:docs.m5stack.com)",
+      "WebSearch",
+      "WebFetch(domain:community.m5stack.com)",
+      "WebFetch(domain:www.cnx-software.com)",
+      "WebFetch(domain:community.platformio.org)"
+    ]
+  }
+}

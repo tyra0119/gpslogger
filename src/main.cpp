@@ -302,7 +302,7 @@ void logToSD() {
     String path = buildLogPath();  // VFS パス (/sdcard/gpslog/...)
 
     struct stat st;
-    bool isNew = (stat(path.c_str(), &st) != 0);
+    bool isNew = (stat(path.c_str(), &st) != 0 || st.st_size == 0);
 
     FILE* fp = fopen(path.c_str(), "a");
     if (!fp) {

@@ -6,13 +6,13 @@
 // GPS Unit v1.1 を M5Stack Tab5 の HY2.0-4P Port A に接続してください。
 //
 // 配線 (HY2.0-4P 4ピン):
-//   GPS Unit TX  →  White (G54) = Tab5 RX
-//   GPS Unit RX  →  Yellow (G53) = Tab5 TX
-//   GND          →  Black (GND)
-//   3.3V         →  Red (5V/3.3V)
-#define GPS_RX_PIN  54      // White (G54) ← GPS Unit TX
-#define GPS_TX_PIN  53      // Yellow (G53) → GPS Unit RX
-#define GPS_BAUD    115200   // 9600 で化けたため変更
+//   Pin 1 (Red)    → 3.3V
+//   Pin 2 (White)  → G54 (Tab5 RX ← GPS TX)
+//   Pin 3 (Yellow) → G53 (Tab5 TX → GPS RX)
+//   Pin 4 (Black)  → GND
+#define GPS_RX_PIN  54      // G54 (White)  ← GPS Unit TX
+#define GPS_TX_PIN  53      // G53 (Yellow) → GPS Unit RX
+#define GPS_BAUD    115200
 
 // =============================================================
 // SD カード設定 (M5Stack Tab5 SDIO 4ビットモード)

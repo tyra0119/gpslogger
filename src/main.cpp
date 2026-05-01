@@ -9,7 +9,6 @@
  *   - 省電力設計（目標バッテリー持続: 24 時間以上）
  *
  * 省電力のポイント:
- *   - CPU 周波数 240MHz → 80MHz に削減
  *   - WiFi / Bluetooth は完全オフ (使用しない)
  *   - ディスプレイはボタン押下時のみ点灯
  *
@@ -62,8 +61,6 @@ struct AddressInfo {
 
 TinyGPSPlus    gps;
 HardwareSerial gpsSerial(2);
-char           gpsRawPreview[24] = "---";  // 受信生データ先頭プレビュー
-uint8_t        gpsPreviewLen     = 0;
 
 GpsSnapshot current;
 AddressInfo address;
@@ -93,21 +90,12 @@ bool locationMoved(double newLat, double newLon);
 // setup
 // =============================================================
 void setup() {
-    delay(3000);           // USB CDC 再接続待ち
     Serial.begin(115200);
-    Serial.println("[BOOT] Serial OK");
 
     auto cfg = M5.config();
-    Serial.println("[BOOT] M5.begin...");
     M5.begin(cfg);
-    Serial.println("[BOOT] M5.begin OK");
 
     Serial.println("[GPS Logger] Booting...");
-
-    // 省電力: CPU 周波数を下げる
-    // ESP32-P4 での動作確認後に有効化してください
-    // setCpuFrequencyMhz(CPU_FREQ_MHZ);
-    // Serial.printf("[Power] CPU: %d MHz\n", getCpuFrequencyMhz());
 
     // ディスプレイ: 消灯状態で初期化
     M5.Display.setRotation(1);
@@ -147,19 +135,6 @@ void loop() {
 
     uint32_t now = millis();
 
-    // GPS 受信デバッグ: 5 秒ごとに処理文字数を表示
-    static uint32_t lastGpsDebug  = 0;
-    static uint32_t lastCharCount = 0;
-    if (now - lastGpsDebug >= 5000) {
-        uint32_t chars = gps.charsProcessed();
-        Serial.printf("[GPS DBG] 処理文字数=%u (+%u)  衛星=%u  フィックス=%s\n",
-                      chars, chars - lastCharCount,
-                      gps.satellites.value(),
-                      current.valid ? "あり" : "なし");
-        lastCharCount = chars;
-        lastGpsDebug  = now;
-    }
-
     // GPS フィックス待ち (起動直後)
     if (waitingForFix) {
         if (current.valid) {
@@ -198,13 +173,11 @@ void loop() {
 // =============================================================
 void initSD() {
     SD_MMC.setPins(SD_CLK_PIN, SD_CMD_PIN, SD_D0_PIN, SD_D1_PIN, SD_D2_PIN, SD_D3_PIN);
-    if (SD_MMC.begin("/sdcard", true, false, 400000)) {  // 1-bit mode, 400kHz
+    if (SD_MMC.begin("/sdcard", true, false, 400000)) {
         sdAvailable = true;
         if (!SD_MMC.exists(LOG_DIRECTORY)) {
-            if (SD_MMC.mkdir(LOG_DIRECTORY)) {
-                Serial.printf("[SD] Created %s\n", LOG_DIRECTORY);
-            } else {
-                Serial.printf("[SD] ERROR: mkdir %s failed!\n", LOG_DIRECTORY);
+            if (!SD_MMC.mkdir(LOG_DIRECTORY)) {
+                Serial.printf("[SD] ERROR: mkdir %s failed\n", LOG_DIRECTORY);
             }
         }
         if (!SD_MMC.exists("/gpsdb")) {
@@ -224,12 +197,6 @@ void initSD() {
 void readGPS() {
     while (gpsSerial.available() > 0) {
         char c = gpsSerial.read();
-        // '$' で始まる NMEA 文の先頭 23 文字を常に最新に更新
-        if (c == '$') gpsPreviewLen = 0;
-        if (gpsPreviewLen < sizeof(gpsRawPreview) - 1) {
-            gpsRawPreview[gpsPreviewLen++] = (c >= 0x20 && c < 0x7f) ? c : '.';
-            gpsRawPreview[gpsPreviewLen]   = '\0';
-        }
         if (gps.encode(c) && gps.location.isValid()) {
             bool moved = locationMoved(gps.location.lat(), gps.location.lng());
 
@@ -270,14 +237,7 @@ bool locationMoved(double newLat, double newLon) {
 // SD カードへ GPS データを書き込む
 // =============================================================
 void logToSD() {
-    if (!sdAvailable) {
-        Serial.println("[LOG] Skip: SD not available");
-        return;
-    }
-    if (!current.valid) {
-        Serial.println("[LOG] Skip: No GPS fix");
-        return;
-    }
+    if (!sdAvailable || !current.valid) return;
 
     String path  = buildLogPath();
     bool   isNew = !SD_MMC.exists(path);
@@ -329,7 +289,6 @@ void turnOnDisplay() {
     lastDisplayUpdate = 0;
     M5.Display.setBrightness(DISPLAY_BRIGHTNESS);
     drawDisplay();
-    Serial.println("[Display] ON");
 }
 
 // =============================================================
@@ -339,7 +298,6 @@ void turnOffDisplay() {
     displayOn = false;
     M5.Display.setBrightness(0);
     M5.Display.fillScreen(TFT_BLACK);
-    Serial.println("[Display] OFF");
 }
 
 // =============================================================
@@ -385,32 +343,6 @@ void drawDisplay() {
         M5.Display.setTextSize(2);
         M5.Display.setCursor(12, y);
         M5.Display.print("衛星が見える場所へ移動してください");
-        y += 36;
-
-        // GPS デバッグ情報
-        uint32_t chars = gps.charsProcessed();
-        M5.Display.setTextColor(chars > 0 ? TFT_GREEN : TFT_RED);
-        M5.Display.setCursor(12, y);
-        M5.Display.printf("UART: %s  chars=%u",
-                          chars > 0 ? "受信中" : "データなし", chars);
-        y += 30;
-        M5.Display.setTextColor(TFT_LIGHTGREY);
-        M5.Display.setCursor(12, y);
-        M5.Display.printf("衛星: %u機  HDOP: %.1f",
-                          gps.satellites.isValid() ? gps.satellites.value() : 0,
-                          gps.hdop.isValid() ? gps.hdop.hdop() : 99.9f);
-        y += 30;
-        // チェックサムエラーが多い場合はボーレートが違う
-        uint32_t failed = gps.failedChecksum();
-        M5.Display.setTextColor(failed > 10 ? TFT_RED : TFT_DARKGREY);
-        M5.Display.setCursor(12, y);
-        M5.Display.printf("文: ok=%u  fix=%u  err=%u",
-                          gps.passedChecksum(), gps.sentencesWithFix(), failed);
-        y += 30;
-        // 正常な NMEA なら "$GPRMC,..." または "$GNRMC,..." で始まるはず
-        M5.Display.setTextColor(TFT_CYAN);
-        M5.Display.setCursor(12, y);
-        M5.Display.printf("RAW: %s", gpsRawPreview);
     } else {
         // 住所表示
         if (address.fetched) {
@@ -492,7 +424,7 @@ void onButtonPressed() {
                 strncpy(address.city, ADDR_DB_PATH " を確認", sizeof(address.city) - 1);
                 address.fetched = true;
             }
-            displayOnTime = millis();  // 検索時間分タイムアウトをリセット
+            displayOnTime = millis();
             drawDisplay();
         }
     } else {
@@ -504,12 +436,14 @@ void onButtonPressed() {
 
 // =============================================================
 // SD カードの addr.csv から最近傍の市区町村を検索する
+//
+// アルゴリズム:
+//   CSV は緯度昇順でソートされている。
+//   対象緯度 ±ADDR_SEARCH_RANGE_DEG のレコードのみ評価し、
+//   近似距離 (dLat² + (dLon·cosLat)²) が最小のレコードを返す。
 // =============================================================
 bool lookupAddress(double targetLat, double targetLon) {
-    if (!sdAvailable) {
-        Serial.println("[Addr] SD not available");
-        return false;
-    }
+    if (!sdAvailable) return false;
 
     File f = SD_MMC.open(ADDR_DB_PATH);
     if (!f) {
@@ -517,17 +451,15 @@ bool lookupAddress(double targetLat, double targetLon) {
         return false;
     }
 
-    // ヘッダー行をスキップ
-    f.readStringUntil('\n');
+    f.readStringUntil('\n');  // ヘッダー行をスキップ
 
-    float bestDistSq  = ADDR_MAX_DIST_SQ;
+    float bestDistSq   = ADDR_MAX_DIST_SQ;
     char  bestPref[32] = "";
     char  bestCity[48] = "";
+    float cosLat       = cosf((float)targetLat * (float)M_PI / 180.0f);
 
-    float cosLat = cosf((float)targetLat * (float)M_PI / 180.0f);
-
-    char  line[128];
-    int   lineLen;
+    char line[128];
+    int  lineLen;
 
     while (f.available()) {
         lineLen = 0;
@@ -553,14 +485,12 @@ bool lookupAddress(double targetLat, double targetLon) {
         if (fi < 4) continue;
 
         float recLat = atof(fields[0]);
-        float recLon = atof(fields[1]);
-
-        float dLat = recLat - (float)targetLat;
+        float dLat   = recLat - (float)targetLat;
 
         if (dLat < -ADDR_SEARCH_RANGE_DEG) continue;
         if (dLat >  ADDR_SEARCH_RANGE_DEG) break;
 
-        float dLon   = (recLon - (float)targetLon) * cosLat;
+        float dLon   = (atof(fields[1]) - (float)targetLon) * cosLat;
         float distSq = dLat * dLat + dLon * dLon;
 
         if (distSq < bestDistSq) {
@@ -577,12 +507,10 @@ bool lookupAddress(double targetLat, double targetLon) {
     if (bestDistSq < ADDR_MAX_DIST_SQ) {
         strncpy(address.prefecture, bestPref, sizeof(address.prefecture) - 1);
         strncpy(address.city,       bestCity, sizeof(address.city) - 1);
-        address.fetched    = true;
-        address.cachedLat  = targetLat;
-        address.cachedLon  = targetLon;
-
-        Serial.printf("[Addr] %s %s (dist²=%.4f)\n",
-                      address.prefecture, address.city, bestDistSq);
+        address.fetched   = true;
+        address.cachedLat = targetLat;
+        address.cachedLon = targetLon;
+        Serial.printf("[Addr] %s %s\n", address.prefecture, address.city);
         return true;
     }
 

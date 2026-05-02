@@ -27,6 +27,7 @@
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #include <math.h>
+#include <time.h>
 #include <sys/stat.h>
 #include "config.h"
 
@@ -83,6 +84,7 @@ char     sdErrMsg[32]      = "";
 // =============================================================
 // 関数プロトタイプ
 // =============================================================
+struct tm utcToJst(const GpsSnapshot& s);
 void initSD();
 void readGPS();
 void logToSD();
@@ -316,11 +318,12 @@ void logToSD() {
         fputs("timestamp,latitude,longitude,altitude_m,speed_kmh,satellites,hdop\n", fp);
     }
 
+    struct tm jst = utcToJst(current);
     char line[128];
     snprintf(line, sizeof(line),
-             "%04d-%02d-%02dT%02d:%02d:%02dZ,%.6f,%.6f,%.1f,%.1f,%d,%.2f\n",
-             current.year, current.month, current.day,
-             current.hour, current.minute, current.second,
+             "%04d-%02d-%02dT%02d:%02d:%02d+09:00,%.6f,%.6f,%.1f,%.1f,%d,%.2f\n",
+             jst.tm_year + 1900, jst.tm_mon + 1, jst.tm_mday,
+             jst.tm_hour, jst.tm_min, jst.tm_sec,
              current.lat, current.lon,
              current.altitude, current.speed,
              current.satellites, current.hdop);
@@ -342,13 +345,30 @@ void logToSD() {
 }
 
 // =============================================================
-// ログファイルパスを生成 (日付別)
+// UTC → JST 変換 (+9時間、月末・年末は mktime が正規化)
+// =============================================================
+struct tm utcToJst(const GpsSnapshot& s) {
+    struct tm t = {};
+    t.tm_year  = s.year - 1900;
+    t.tm_mon   = s.month - 1;
+    t.tm_mday  = s.day;
+    t.tm_hour  = s.hour + 9;  // JST = UTC+9
+    t.tm_min   = s.minute;
+    t.tm_sec   = s.second;
+    t.tm_isdst = -1;
+    mktime(&t);  // hour>=24 の繰り上げなどを正規化
+    return t;
+}
+
+// =============================================================
+// ログファイルパスを生成 (JST 日付別)
 // =============================================================
 String buildLogPath() {
     if (current.year > 0) {
+        struct tm jst = utcToJst(current);
         char buf[80];
         snprintf(buf, sizeof(buf), "/sdcard%s/gps_%04d%02d%02d.csv",
-                 LOG_DIRECTORY, current.year, current.month, current.day);
+                 LOG_DIRECTORY, jst.tm_year + 1900, jst.tm_mon + 1, jst.tm_mday);
         return String(buf);
     }
     return "/sdcard" + String(LOG_DIRECTORY) + "/gps_nodate.csv";
@@ -462,12 +482,13 @@ void drawDisplay() {
                           current.altitude, current.speed, current.hdop);
         y += 20;
 
-        // UTC 時刻
+        // JST 時刻
         if (current.year > 0) {
+            struct tm jst = utcToJst(current);
             M5.Display.setCursor(12, y);
-            M5.Display.printf("UTC: %04d-%02d-%02d %02d:%02d:%02d",
-                              current.year, current.month, current.day,
-                              current.hour, current.minute, current.second);
+            M5.Display.printf("JST: %04d-%02d-%02d %02d:%02d:%02d",
+                              jst.tm_year + 1900, jst.tm_mon + 1, jst.tm_mday,
+                              jst.tm_hour, jst.tm_min, jst.tm_sec);
         }
     }
 

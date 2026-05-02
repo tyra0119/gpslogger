@@ -156,6 +156,74 @@ out center tags;
 
 
 # =============================================================
+# 政令指定都市の区の取得 (admin_level=8)
+# =============================================================
+def get_wards(pref_name: str, area_id: int, city_records: list[dict]) -> list[dict]:
+    """政令指定都市の区 (admin_level=8) を取得する。
+    city フィールドは "大阪市北区" のように親市名 + 区名で構成する。"""
+    safe_name = pref_name.replace("/", "_")
+    query = f"""
+[out:json][timeout:90];
+area({area_id})->.pref;
+rel["boundary"="administrative"]["admin_level"="8"](area.pref);
+out center tags;
+"""
+    data = cached_query(f"ward_{safe_name}", query, timeout=90)
+    if not data:
+        return []
+
+    results = []
+    for elem in data["elements"]:
+        if elem.get("type") != "relation":
+            continue
+        center = elem.get("center")
+        if not center:
+            continue
+        tags = elem.get("tags", {})
+        ward_name = tags.get("name", "").strip()
+        if not ward_name:
+            continue
+
+        # 親市名の特定: is_in:city タグ → is_in 解析 → 近傍の市区町村
+        parent = (
+            tags.get("is_in:city", "").strip()
+            or _parse_is_in_city(tags.get("is_in", ""))
+            or _nearest_city(center["lat"], center["lon"], city_records)
+        )
+        if not parent:
+            continue
+
+        results.append({
+            "lat":        round(center["lat"], 6),
+            "lon":        round(center["lon"], 6),
+            "prefecture": pref_name,
+            "city":       f"{parent}{ward_name}",
+        })
+
+    return results
+
+
+def _parse_is_in_city(is_in: str) -> str:
+    """'is_in' タグ "大阪市, 大阪府, 日本" から市名を抽出する。"""
+    for part in (p.strip() for p in is_in.split(",")):
+        if part.endswith("市"):
+            return part
+    return ""
+
+
+def _nearest_city(lat: float, lon: float, city_records: list[dict]) -> str:
+    """近傍の市区町村名を返すフォールバック。"""
+    best_dist = float("inf")
+    best_name = ""
+    for r in city_records:
+        d = (r["lat"] - lat) ** 2 + (r["lon"] - lon) ** 2
+        if d < best_dist:
+            best_dist = d
+            best_name = r["city"]
+    return best_name
+
+
+# =============================================================
 # メイン処理
 # =============================================================
 def main():
@@ -167,12 +235,17 @@ def main():
     for i, pref in enumerate(prefectures):
         print(f"[{i + 1:2d}/{len(prefectures)}] {pref['name']} ...")
         munis = get_municipalities(pref["name"], pref["area_id"])
+        wards = get_wards(pref["name"], pref["area_id"], munis)
         all_records.extend(munis)
-        print(f"  → {len(munis)} 市区町村")
+        all_records.extend(wards)
+
+        ward_str = f" + 区 {len(wards)}件" if wards else ""
+        print(f"  → 市区町村 {len(munis)}件{ward_str}")
 
         # キャッシュが無い場合のみ待機 (キャッシュ利用時は即時)
-        cache_key = f"muni_{pref['name'].replace('/', '_')}"
-        if not (CACHE_DIR / f"{cache_key}.json").exists():
+        muni_cached = (CACHE_DIR / f"muni_{pref['name'].replace('/', '_')}.json").exists()
+        ward_cached = (CACHE_DIR / f"ward_{pref['name'].replace('/', '_')}.json").exists()
+        if not muni_cached or not ward_cached:
             time.sleep(REQUEST_WAIT)
 
     # 緯度昇順でソート (ESP32 側の早期終了に利用)
